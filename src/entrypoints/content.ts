@@ -1,9 +1,24 @@
 import TinySegmenter from 'tiny-segmenter';
+import { urlProtector } from '@/lib/utils/UrlProtector';
+import { logger } from '@/lib/utils/Logger';
+import {
+  LANGUAGE_DETECTION,
+  SEGMENTATION,
+  UI,
+  DEFAULT_SETTINGS,
+  STORAGE_KEYS,
+  DOM_IDS,
+  CSS_CLASSES,
+  CONTENT_SELECTORS,
+  PATTERNS,
+  type Settings,
+} from '@/lib/constants';
+import logoUrl from '@/assets/logo.png';
 
 export default defineContentScript({
   matches: ['<all_urls>'],
   main() {
-    console.log('Text reader extension loaded');
+    logger.info('Text reader extension loaded');
 
     // グローバル状態
     let speedReadingActive = false;
@@ -12,21 +27,7 @@ export default defineContentScript({
     let imageData: Map<number, { url: string; alt: string; caption?: string }[]> = new Map();
 
     // 設定
-    interface Settings {
-      fontSize: number;
-      textColor: string;
-      backgroundColor: string;
-      showImageIndicators: boolean;
-      maxWordsPerPhrase: number;
-    }
-
-    let settings: Settings = {
-      fontSize: 64,
-      textColor: '#FFE66D',
-      backgroundColor: 'rgba(0, 0, 0, 0.95)',
-      showImageIndicators: true,
-      maxWordsPerPhrase: 2
-    };
+    let settings: Settings = { ...DEFAULT_SETTINGS };
 
     // 言語を検出
     function detectLanguage(text: string): 'ja' | 'en' | 'mixed' {
@@ -35,9 +36,9 @@ export default defineContentScript({
       const totalChars = text.replace(/\s/g, '').length;
       const japaneseRatio = japaneseChars.length / totalChars;
 
-      if (japaneseRatio > 0.3) {
+      if (japaneseRatio > LANGUAGE_DETECTION.JAPANESE_RATIO_THRESHOLD) {
         return 'ja';
-      } else if (japaneseRatio > 0.1) {
+      } else if (japaneseRatio > LANGUAGE_DETECTION.MIXED_RATIO_THRESHOLD) {
         return 'mixed';
       } else {
         return 'en';
@@ -47,82 +48,14 @@ export default defineContentScript({
     // 日本語テキストをフレーズ単位で分割（改善版）
     function segmentJapanese(text: string): string[] {
       // URLを先に抽出して保護
-      const urlPattern = /(https?:\/\/[^\s\u3000]+|www\.[^\s\u3000]+)/g;
-      const urls: string[] = [];
-      let processedText = text.replace(urlPattern, (match) => {
-        const index = urls.length;
-        urls.push(match);
-        return `__URL_${index}__`;
-      });
+      const { text: processedText, urls } = urlProtector.protect(text);
 
       const segmenter = new TinySegmenter();
       let words = segmenter.segment(processedText);
 
-      // URLプレースホルダーが分割されている場合は結合（改善版）
-      // 全単語を結合して再度プレースホルダーを探す方式に変更
-      const mergedWords: string[] = [];
-      let i = 0;
-      while (i < words.length) {
-        let word = words[i].trim();
-
-        // プレースホルダーの一部を検出（より広範囲に）
-        // _, __, URL, 数字のいずれかを含む場合にチェック
-        if (word.includes('_') || word.includes('URL') || /^\d+$/.test(word)) {
-          // 前後の単語も含めて結合を試みる
-          let startIdx = Math.max(0, i - 2); // 2つ前から
-          let placeholder = '';
-          let j = startIdx;
-          let maxLookAhead = 20;
-
-          // 前後の単語を結合してプレースホルダーを探す
-          while (j < words.length && j < startIdx + maxLookAhead) {
-            placeholder += words[j].trim();
-
-            // 完全なプレースホルダーが見つかったかチェック
-            const match = placeholder.match(/__URL_\d+__/);
-            if (match) {
-              const fullPlaceholder = match[0];
-              const beforeMatch = placeholder.substring(0, match.index);
-              const afterMatch = placeholder.substring(match.index! + fullPlaceholder.length);
-
-              console.log('Found and merged URL placeholder:', fullPlaceholder);
-
-              // マッチ前の部分を追加
-              if (beforeMatch) {
-                const beforeWords = beforeMatch.split(/\s+/).filter(w => w);
-                mergedWords.push(...beforeWords);
-              }
-
-              // プレースホルダーを追加
-              mergedWords.push(fullPlaceholder);
-
-              // 後の部分は words に戻す
-              if (afterMatch.trim()) {
-                words.splice(j + 1, 0, afterMatch.trim());
-              }
-
-              // 使用した単語をスキップ
-              i = j + 1;
-
-              // 次のループへ
-              break;
-            }
-
-            j++;
-          }
-
-          // プレースホルダーが見つかった場合は次へ
-          if (placeholder.match(/__URL_\d+__/)) {
-            continue;
-          }
-        }
-
-        mergedWords.push(word);
-        i++;
-      }
-
-      words = mergedWords.filter(w => w.length > 0);
-      console.log('After merging placeholders:', words);
+      // URLプレースホルダーが分割されている場合は結合
+      words = urlProtector.mergeFragmentedPlaceholders(words);
+      logger.debug('After merging placeholders:', words);
 
       // より自然なフレーズを作成
       const result: string[] = [];
@@ -139,15 +72,13 @@ export default defineContentScript({
         const nextWord = idx < words.length - 1 ? words[idx + 1] : '';
 
         // 空白のみの場合はスキップ
-        if (/^\s+$/.test(word)) {
+        if (PATTERNS.WHITESPACE_ONLY.test(word)) {
           continue;
         }
 
         // URLプレースホルダーを検出
-        console.log('Checking word for URL placeholder:', word);
-        const urlPlaceholder = word.match(/__URL_(\d+)__/);
-        if (urlPlaceholder) {
-          console.log('✓ Found URL placeholder match:', urlPlaceholder);
+        if (urlProtector.isPlaceholder(word)) {
+          logger.debug('Found URL placeholder:', word);
           // 現在のバッファを追加
           if (buffer) {
             result.push(buffer);
@@ -155,29 +86,15 @@ export default defineContentScript({
             wordCount = 0;
           }
 
-          // URLを復元してドメインを抽出
-          const url = urls[parseInt(urlPlaceholder[1])];
-          console.log('Restoring URL from placeholder:', url);
-          let domain = url;
-          try {
-            const urlObj = new URL(url.startsWith('http') ? url : 'https://' + url);
-            domain = urlObj.hostname.replace('www.', '');
-          } catch (e) {
-            // URLパース失敗時はそのまま使用
-            console.warn('URL parse failed:', url, e);
-          }
-
-          // URL全体を保存（クリック可能にするため）
-          const urlLink = `[🔗${domain}](${url})`;
-          console.log('Created URL link:', urlLink);
+          // URLを復元してリンク形式に変換
+          const urlLink = urlProtector.toUrlLink(word, urls);
+          logger.debug('Created URL link:', urlLink);
           result.push(urlLink);
           continue;
-        } else if (word.includes('URL') || word.includes('__')) {
-          console.log('✗ Word contains URL/__ but does not match pattern:', word);
         }
 
         // 引用符・括弧の開始を検出
-        if (/^[「（(]/.test(word)) {
+        if (PATTERNS.QUOTE_START.test(word)) {
           inQuote = true;
           quoteBuffer = word;
           quoteWords = [word];
@@ -190,11 +107,11 @@ export default defineContentScript({
           quoteWords.push(word);
 
           // 引用符・括弧の終了を検出
-          if (/[」）)]$/.test(word)) {
+          if (PATTERNS.QUOTE_END.test(word)) {
             inQuote = false;
 
-            // 短い引用（10文字以内）の場合はそのまま追加
-            if (quoteBuffer.length <= 12) {
+            // 短い引用の場合はそのまま追加
+            if (quoteBuffer.length <= SEGMENTATION.SHORT_QUOTE_LENGTH) {
               buffer += quoteBuffer;
               wordCount++;
               quoteBuffer = '';
@@ -204,7 +121,7 @@ export default defineContentScript({
               // 長い引用は分割して処理
               for (const qWord of quoteWords) {
                 buffer += qWord;
-                if (!/^[、。！？,.!?「」（）()]$/.test(qWord)) {
+                if (!PATTERNS.PUNCTUATION.test(qWord) && !PATTERNS.QUOTE_START.test(qWord) && !PATTERNS.QUOTE_END.test(qWord)) {
                   wordCount++;
                 }
 
@@ -230,23 +147,20 @@ export default defineContentScript({
         // パターン: 2024年11月15日、11月15日、2024/11/15、など
         if (/^\d{1,4}$/.test(word)) {
           let dateBuffer = word;
-          let j = i + 1;
+          let j = idx + 1;
           let isDate = false;
 
           // 年月日のパターンをチェック
-          while (j < words.length && j < i + 10) { // 最大10トークン先まで
+          while (j < words.length && j < idx + SEGMENTATION.MAX_DATE_TOKENS) {
             const next = words[j];
 
             // 年月日、/, -, などの区切り文字
-            if (/^[年月日\/\-]$/.test(next) || /^\d{1,4}$/.test(next)) {
+            if (PATTERNS.DATE_SEPARATOR.test(next) || /^\d{1,4}$/.test(next)) {
               dateBuffer += next;
               j++;
 
               // 日付パターンを検出
-              if (/年/.test(next) || /月/.test(next) || /日/.test(next)) {
-                isDate = true;
-              }
-              if (/\//.test(next) || /\-/.test(next)) {
+              if (PATTERNS.HAS_DATE.test(next)) {
                 isDate = true;
               }
             } else {
@@ -258,7 +172,7 @@ export default defineContentScript({
           if (isDate && dateBuffer.length > word.length) {
             buffer += dateBuffer;
             wordCount++;
-            i = j - 1;
+            idx = j - 1;
 
             if (wordCount >= settings.maxWordsPerPhrase) {
               result.push(buffer);
@@ -270,20 +184,20 @@ export default defineContentScript({
         }
 
         // 数字（4桁以内）を1つのまとまりとして扱う
-        if (/^\d{1,4}$/.test(word) || /^\d{1,3}(,\d{3})?$/.test(word)) {
+        if (PATTERNS.NUMBER.test(word) || PATTERNS.NUMBER_WITH_COMMA.test(word)) {
           // 次の単語も数字の場合は結合を試みる
           let numberBuffer = word;
-          let j = i + 1;
-          while (j < words.length && /^[\d,]+$/.test(words[j]) && numberBuffer.replace(/,/g, '').length <= 4) {
+          let j = idx + 1;
+          while (j < words.length && /^[\d,]+$/.test(words[j]) && numberBuffer.replace(/,/g, '').length <= SEGMENTATION.MAX_NUMBER_DIGITS) {
             numberBuffer += words[j];
             j++;
           }
 
           // 4桁以内なら1つのまとまりとして追加
-          if (numberBuffer.replace(/,/g, '').length <= 4) {
+          if (numberBuffer.replace(/,/g, '').length <= SEGMENTATION.MAX_NUMBER_DIGITS) {
             buffer += numberBuffer;
             wordCount++;
-            i = j - 1; // ループカウンタを調整
+            idx = j - 1; // ループカウンタを調整
 
             // 単語数チェック
             if (wordCount >= settings.maxWordsPerPhrase) {
@@ -296,7 +210,7 @@ export default defineContentScript({
         }
 
         // 句読点のみの場合は、必ず前のバッファに追加してから区切る
-        const isPunctuationOnly = /^[、。！？,.!?]+$/.test(word);
+        const isPunctuationOnly = PATTERNS.PUNCTUATION.test(word);
 
         if (isPunctuationOnly) {
           // バッファに内容がある場合のみ、句読点を追加して出力
@@ -314,8 +228,8 @@ export default defineContentScript({
         wordCount++;
 
         // て形の動詞＋補助動詞（いる、ある、おく、みる等）は結合
-        const isTeForm = /[てで]$/.test(word);
-        const isAuxiliaryVerb = /^(いる|ある|おく|みる|しまう|くる|いく|もらう|あげる|くれる)/.test(nextWord);
+        const isTeForm = PATTERNS.TE_FORM.test(word);
+        const isAuxiliaryVerb = PATTERNS.AUXILIARY_VERB.test(nextWord);
 
         // 区切るかどうかの判定（単語数のみで判断）
         const shouldBreak =
@@ -332,7 +246,7 @@ export default defineContentScript({
       }
 
       // 残りのバッファを追加
-      if (buffer.trim().length > 0 && !/^[、。！？,.!?]+$/.test(buffer.trim())) {
+      if (buffer.trim().length > 0 && !PATTERNS.PUNCTUATION.test(buffer.trim())) {
         result.push(buffer);
       }
 
@@ -342,12 +256,12 @@ export default defineContentScript({
         const phrase = result[i];
 
         // 句読点で始まる場合、前のフレーズに結合
-        if (/^[、。！？,.!?」）)]/.test(phrase.trim())) {
+        if (PATTERNS.STARTS_WITH_PUNCTUATION.test(phrase.trim())) {
           if (cleanedResult.length > 0) {
             cleanedResult[cleanedResult.length - 1] += phrase;
           } else {
             // 最初のフレーズの場合は、そのまま追加（句読点を削除）
-            cleanedResult.push(phrase.replace(/^[、。！？,.!?」）)]+/, ''));
+            cleanedResult.push(phrase.replace(PATTERNS.STARTS_WITH_PUNCTUATION, ''));
           }
         } else {
           cleanedResult.push(phrase);
@@ -362,78 +276,13 @@ export default defineContentScript({
       const phrases: string[] = [];
 
       // URLを先に抽出して置換
-      const urlPattern = /(https?:\/\/[^\s]+|www\.[^\s]+)/g;
-      const urls: string[] = [];
-      let processedText = text.replace(urlPattern, (match) => {
-        const index = urls.length;
-        urls.push(match);
-        return `__URL_${index}__`;
-      });
+      const { text: processedText, urls } = urlProtector.protect(text);
 
       // 句点（.!?）または読点（,;:）で分割
       let parts = processedText.split(/([.!?]|[,;:](?=\s))/);
 
-      // URLプレースホルダーが分割されている場合は結合（改善版）
-      const mergedParts: string[] = [];
-      let i = 0;
-      while (i < parts.length) {
-        let part = parts[i];
-
-        // プレースホルダーの一部を検出（より広範囲に）
-        if (part && (part.includes('_') || part.includes('URL') || /\d/.test(part))) {
-          // 前後の部分も含めて結合を試みる
-          let startIdx = Math.max(0, i - 2);
-          let placeholder = '';
-          let j = startIdx;
-          let maxLookAhead = 20;
-
-          // 前後の部分を結合してプレースホルダーを探す
-          while (j < parts.length && j < startIdx + maxLookAhead) {
-            placeholder += parts[j];
-
-            // 完全なプレースホルダーが見つかったかチェック
-            const match = placeholder.match(/__URL_\d+__/);
-            if (match) {
-              const fullPlaceholder = match[0];
-              const beforeMatch = placeholder.substring(0, match.index);
-              const afterMatch = placeholder.substring(match.index! + fullPlaceholder.length);
-
-              console.log('Found and merged URL placeholder (English):', fullPlaceholder);
-
-              // マッチ前の部分を追加
-              if (beforeMatch.trim()) {
-                mergedParts.push(beforeMatch);
-              }
-
-              // プレースホルダーを追加
-              mergedParts.push(fullPlaceholder);
-
-              // 後の部分は parts に戻す
-              if (afterMatch.trim()) {
-                parts.splice(j + 1, 0, afterMatch);
-              }
-
-              // 使用した部分をスキップ
-              i = j + 1;
-              break;
-            }
-
-            j++;
-          }
-
-          // プレースホルダーが見つかった場合は次へ
-          if (placeholder.match(/__URL_\d+__/)) {
-            continue;
-          }
-        }
-
-        if (part) {
-          mergedParts.push(part);
-        }
-        i++;
-      }
-
-      parts = mergedParts;
+      // URLプレースホルダーが分割されている場合は結合
+      parts = urlProtector.mergeFragmentedPlaceholders(parts);
 
       let buffer = '';
       let wordCount = 0;
@@ -443,8 +292,7 @@ export default defineContentScript({
         if (!part || !part.trim()) continue;
 
         // URLプレースホルダーを検出
-        const urlPlaceholder = part.match(/__URL_(\d+)__/);
-        if (urlPlaceholder) {
+        if (urlProtector.isPlaceholder(part)) {
           // 現在のバッファを追加
           if (buffer.trim()) {
             phrases.push(buffer.trim());
@@ -452,17 +300,8 @@ export default defineContentScript({
             wordCount = 0;
           }
 
-          // URLを復元してドメインを抽出
-          const url = urls[parseInt(urlPlaceholder[1])];
-          let domain = url;
-          try {
-            const urlObj = new URL(url.startsWith('http') ? url : 'https://' + url);
-            domain = urlObj.hostname.replace('www.', '');
-          } catch (e) {
-            // URLパース失敗時はそのまま使用
-          }
-
-          phrases.push(`[🔗${domain}](${url})`);
+          // URLを復元してリンク形式に変換
+          phrases.push(urlProtector.toUrlLink(part, urls));
           continue;
         }
 
@@ -500,7 +339,7 @@ export default defineContentScript({
     // テキストを単語に分割（改善版）
     function segmentText(text: string): string[] {
       const language = detectLanguage(text);
-      console.log('Detected language:', language);
+      logger.debug('Detected language:', language);
 
       if (language === 'ja') {
         return segmentJapanese(text);
@@ -533,29 +372,16 @@ export default defineContentScript({
       let textIndex = 0;
 
       // 除外する要素のセレクター
-      const excludeSelectors = 'nav, header, footer, aside, .nav, .navbar, .header, .footer, .sidebar, .menu, .advertisement, .ad, script, style, noscript';
+      const excludeSelectors = CSS_CLASSES.NAV;
 
       // 本文を含む可能性が高い要素を優先的に検索
       let mainContent: Element | null = null;
 
       // まずarticle, main, [role="main"]などから本文を探す
-      const contentSelectors = [
-        'article',
-        'main',
-        '[role="main"]',
-        '.article',
-        '.post-content',
-        '.entry-content',
-        '.content',
-        '#content',
-        '.main-content',
-        '#main-content'
-      ];
-
-      for (const selector of contentSelectors) {
+      for (const selector of CONTENT_SELECTORS) {
         mainContent = document.querySelector(selector);
         if (mainContent) {
-          console.log('Main content found:', selector);
+          logger.debug('Main content found:', selector);
           break;
         }
       }
@@ -620,7 +446,7 @@ export default defineContentScript({
         // テキスト要素の場合
         const text = element.textContent?.trim();
         // 最低限の長さでフィルタリング（ナビゲーションリンクなどを除外）
-        if (text && text.length > 20) {
+        if (text && text.length > SEGMENTATION.MIN_TEXT_LENGTH) {
           texts.push(text);
           textIndex++;
         }
@@ -632,7 +458,7 @@ export default defineContentScript({
     // 速読モードのオーバーレイを作成
     function createSpeedReadingOverlay() {
       const overlay = document.createElement('div');
-      overlay.id = 'readash-speed-reading-overlay';
+      overlay.id = DOM_IDS.OVERLAY;
       overlay.style.cssText = `
         position: fixed;
         top: 0;
@@ -646,15 +472,15 @@ export default defineContentScript({
         justify-content: center;
         align-items: center;
         font-family: system-ui, -apple-system, sans-serif;
-        gap: 40px;
+        gap: ${UI.WORD_GAP}px;
       `;
 
       // 進行状況表示
       const progressBar = document.createElement('div');
-      progressBar.id = 'readash-progress';
+      progressBar.id = DOM_IDS.PROGRESS;
       progressBar.style.cssText = `
         position: absolute;
-        top: 20px;
+        top: ${UI.PROGRESS_TOP}px;
         left: 50%;
         transform: translateX(-50%);
         color: rgba(255, 255, 255, 0.7);
@@ -664,7 +490,7 @@ export default defineContentScript({
 
       // テキスト表示エリア（上部・中央）
       const textSection = document.createElement('div');
-      textSection.id = 'readash-text-section';
+      textSection.id = DOM_IDS.TEXT_SECTION;
       textSection.style.cssText = `
         display: flex;
         flex-direction: column;
@@ -679,7 +505,7 @@ export default defineContentScript({
 
       // 単語表示エリア（カラオケスタイル - 縦配置）
       const wordDisplay = document.createElement('div');
-      wordDisplay.id = 'readash-word-display';
+      wordDisplay.id = DOM_IDS.WORD_DISPLAY;
       wordDisplay.style.cssText = `
         display: flex;
         flex-direction: column;
@@ -733,31 +559,6 @@ export default defineContentScript({
       return overlay;
     }
 
-    // URLリンク形式のテキストを処理
-    function parseUrlText(text: string): { isUrl: boolean; domain?: string; url?: string } {
-      // 詳細なデバッグログ
-      console.log('=== parseUrlText Debug ===');
-      console.log('Input text:', text);
-      console.log('Text length:', text.length);
-      console.log('Character codes:', Array.from(text).map((c, i) => `${i}:${c}(${c.charCodeAt(0)})`).join(', '));
-      console.log('Starts with [:', text.startsWith('['));
-      console.log('Contains 🔗:', text.includes('🔗'));
-
-      const urlMatch = text.match(/^\[🔗(.+?)\]\((.+?)\)$/);
-      console.log('Regex match result:', urlMatch);
-
-      if (urlMatch) {
-        console.log('Match groups - domain:', urlMatch[1], 'url:', urlMatch[2]);
-        return {
-          isUrl: true,
-          domain: urlMatch[1],
-          url: urlMatch[2]
-        };
-      }
-      console.log('No match - returning isUrl: false');
-      return { isUrl: false };
-    }
-
     // URLリンク要素を作成
     function createUrlElement(domain: string, url: string, styleText: string): HTMLElement {
       const link = document.createElement('a');
@@ -777,8 +578,8 @@ export default defineContentScript({
 
     // 現在の単語を表示（カラオケスタイル）
     function displayCurrentWord() {
-      const wordDisplay = document.getElementById('readash-word-display');
-      const progressBar = document.getElementById('readash-progress');
+      const wordDisplay = document.getElementById(DOM_IDS.WORD_DISPLAY);
+      const progressBar = document.getElementById(DOM_IDS.PROGRESS);
 
       if (!wordDisplay || !progressBar || words.length === 0) return;
 
@@ -797,16 +598,16 @@ export default defineContentScript({
 
         // 前の単語がURLかチェック
         const prevWordText = words[currentWordIndex - 1];
-        const prevUrlInfo = parseUrlText(prevWordText);
+        const prevUrlInfo = urlProtector.parseUrlLink(prevWordText);
         let prevWordElement: HTMLElement;
 
-        if (prevUrlInfo.isUrl && prevUrlInfo.domain && prevUrlInfo.url) {
+        if (prevUrlInfo && prevUrlInfo.domain && prevUrlInfo.url) {
           // URLの場合はクリック可能なリンクとして表示
           prevWordElement = createUrlElement(
             prevUrlInfo.domain,
             prevUrlInfo.url,
             `
-              color: rgba(255, 255, 255, 0.3);
+              color: rgba(255, 255, 255, ${UI.OPACITY_CONTEXT});
               font-size: 0.6em;
             `
           );
@@ -815,7 +616,7 @@ export default defineContentScript({
           prevWordElement = document.createElement('span');
           prevWordElement.textContent = prevWordText;
           prevWordElement.style.cssText = `
-            color: rgba(255, 255, 255, 0.3);
+            color: rgba(255, 255, 255, ${UI.OPACITY_CONTEXT});
             font-size: 0.6em;
           `;
         }
@@ -829,10 +630,10 @@ export default defineContentScript({
             img.src = imageInfo.url;
             img.alt = imageInfo.alt;
             img.style.cssText = `
-              max-width: 40vw;
-              max-height: 30vh;
+              max-width: ${UI.IMAGE_SIZE_CONTEXT.maxWidth};
+              max-height: ${UI.IMAGE_SIZE_CONTEXT.maxHeight};
               object-fit: contain;
-              opacity: 0.3;
+              opacity: ${UI.OPACITY_CONTEXT};
               margin-top: 10px;
               border-radius: 4px;
             `;
@@ -845,13 +646,13 @@ export default defineContentScript({
 
       // 現在の単語（ハイライト）
       const currentWordText = words[currentWordIndex];
-      console.log('Current word:', currentWordText);
-      const urlInfo = parseUrlText(currentWordText);
-      console.log('Parsed URL info:', urlInfo);
+      logger.debug('Current word:', currentWordText);
+      const urlInfo = urlProtector.parseUrlLink(currentWordText);
+      logger.debug('Parsed URL info:', urlInfo);
       let currentWord: HTMLElement;
 
-      if (urlInfo.isUrl && urlInfo.domain && urlInfo.url) {
-        console.log('Creating URL element:', urlInfo.domain, urlInfo.url);
+      if (urlInfo && urlInfo.domain && urlInfo.url) {
+        logger.debug('Creating URL element:', urlInfo.domain, urlInfo.url);
         currentWord = createUrlElement(
           urlInfo.domain,
           urlInfo.url,
@@ -882,8 +683,8 @@ export default defineContentScript({
           img.src = imageInfo.url;
           img.alt = imageInfo.alt;
           img.style.cssText = `
-            max-width: 80vw;
-            max-height: 60vh;
+            max-width: ${UI.IMAGE_SIZE_CURRENT.maxWidth};
+            max-height: ${UI.IMAGE_SIZE_CURRENT.maxHeight};
             object-fit: contain;
             margin-top: 20px;
             border-radius: 8px;
@@ -905,16 +706,16 @@ export default defineContentScript({
 
         // 次の単語がURLかチェック
         const nextWordText = words[currentWordIndex + 1];
-        const nextUrlInfo = parseUrlText(nextWordText);
+        const nextUrlInfo = urlProtector.parseUrlLink(nextWordText);
         let nextWordElement: HTMLElement;
 
-        if (nextUrlInfo.isUrl && nextUrlInfo.domain && nextUrlInfo.url) {
+        if (nextUrlInfo && nextUrlInfo.domain && nextUrlInfo.url) {
           // URLの場合はクリック可能なリンクとして表示
           nextWordElement = createUrlElement(
             nextUrlInfo.domain,
             nextUrlInfo.url,
             `
-              color: rgba(255, 255, 255, 0.3);
+              color: rgba(255, 255, 255, ${UI.OPACITY_CONTEXT});
               font-size: 0.6em;
             `
           );
@@ -923,7 +724,7 @@ export default defineContentScript({
           nextWordElement = document.createElement('span');
           nextWordElement.textContent = nextWordText;
           nextWordElement.style.cssText = `
-            color: rgba(255, 255, 255, 0.3);
+            color: rgba(255, 255, 255, ${UI.OPACITY_CONTEXT});
             font-size: 0.6em;
           `;
         }
@@ -937,10 +738,10 @@ export default defineContentScript({
             img.src = imageInfo.url;
             img.alt = imageInfo.alt;
             img.style.cssText = `
-              max-width: 40vw;
-              max-height: 30vh;
+              max-width: ${UI.IMAGE_SIZE_CONTEXT.maxWidth};
+              max-height: ${UI.IMAGE_SIZE_CONTEXT.maxHeight};
               object-fit: contain;
-              opacity: 0.3;
+              opacity: ${UI.OPACITY_CONTEXT};
               margin-top: 10px;
               border-radius: 4px;
             `;
@@ -1001,13 +802,13 @@ export default defineContentScript({
           const imgs = extractedImages.get(textIndex)!;
           // そのテキストセグメントの最初のフレーズに画像を関連付け
           imageData.set(phraseIndex, imgs);
-          console.log(`Image mapped to phrase ${phraseIndex}:`, imgs);
+          logger.debug(`Image mapped to phrase ${phraseIndex}:`, imgs);
         }
 
         phraseIndex += phrases.length;
       }
 
-      console.log(`Speed reading started with ${words.length} phrases and ${imageData.size} images`);
+      logger.info(`Speed reading started with ${words.length} phrases and ${imageData.size} images`);
 
       // オーバーレイを作成
       const overlay = createSpeedReadingOverlay();
@@ -1022,7 +823,7 @@ export default defineContentScript({
 
     // 速読モードを終了
     function stopSpeedReading() {
-      const overlay = document.getElementById('readash-speed-reading-overlay');
+      const overlay = document.getElementById(DOM_IDS.OVERLAY);
       if (overlay) {
         overlay.remove();
       }
@@ -1034,17 +835,17 @@ export default defineContentScript({
 
     // 設定を保存
     function saveSettings() {
-      localStorage.setItem('readash-settings', JSON.stringify(settings));
+      localStorage.setItem(STORAGE_KEYS.SETTINGS, JSON.stringify(settings));
     }
 
     // 設定を読み込み
     function loadSettings() {
-      const saved = localStorage.getItem('readash-settings');
+      const saved = localStorage.getItem(STORAGE_KEYS.SETTINGS);
       if (saved) {
         try {
           settings = { ...settings, ...JSON.parse(saved) };
         } catch (e) {
-          console.error('Failed to load settings:', e);
+          logger.error('Failed to load settings:', e);
         }
       }
     }
@@ -1052,7 +853,7 @@ export default defineContentScript({
     // 設定画面を表示
     function showSettings() {
       const settingsOverlay = document.createElement('div');
-      settingsOverlay.id = 'readash-settings-overlay';
+      settingsOverlay.id = DOM_IDS.SETTINGS_OVERLAY;
       settingsOverlay.style.cssText = `
         position: fixed;
         top: 0;
@@ -1138,8 +939,8 @@ export default defineContentScript({
 
       // 設定を即時反映する関数
       const applySettings = () => {
-        const overlay = document.getElementById('readash-speed-reading-overlay');
-        const wordDisplay = document.getElementById('readash-word-display');
+        const overlay = document.getElementById(DOM_IDS.OVERLAY);
+        const wordDisplay = document.getElementById(DOM_IDS.WORD_DISPLAY);
 
         if (overlay) {
           overlay.style.background = settings.backgroundColor;
@@ -1290,8 +1091,7 @@ export default defineContentScript({
 
     // 速読モードを開始するボタンを追加
     const toggleButton = document.createElement('button');
-    toggleButton.id = 'readash-toggle-btn';
-    toggleButton.textContent = '📖';
+    toggleButton.id = DOM_IDS.TOGGLE_BUTTON;
     toggleButton.style.cssText = `
       position: fixed;
       bottom: 20px;
@@ -1299,15 +1099,29 @@ export default defineContentScript({
       width: 60px;
       height: 60px;
       border-radius: 50%;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      background: white;
       border: none;
-      color: white;
-      font-size: 28px;
       cursor: pointer;
       box-shadow: 0 4px 20px rgba(0,0,0,0.3);
       z-index: 999998;
       transition: transform 0.2s;
+      padding: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
     `;
+
+    // ロゴ画像を追加
+    const logo = document.createElement('img');
+    logo.src = logoUrl;
+    logo.alt = 'Readash';
+    logo.style.cssText = `
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    `;
+    toggleButton.appendChild(logo);
+
     toggleButton.onmouseover = () => toggleButton.style.transform = 'scale(1.1)';
     toggleButton.onmouseout = () => toggleButton.style.transform = 'scale(1)';
     toggleButton.onclick = startSpeedReading;
